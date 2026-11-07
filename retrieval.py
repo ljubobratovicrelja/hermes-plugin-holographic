@@ -29,6 +29,17 @@ _ROLE_ENTITY, _ROLE_CONTENT = hrr.ROLE_ENTITY, hrr.ROLE_CONTENT
 # FTS5 operator characters. Inside a token they become spaces of a quoted phrase: "pve-01" -> "pve 01", the same two
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
 _FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
+_PUNCT = ".,;:!?\"'()[]{}#@<>"
+_CLOSED_DEMOTION = 0.35
+
+
+def is_closed(fact: dict) -> bool:
+    """A tombstone: the body opens CLOSED/SUPERSEDED or a tag marks it. Live positions must outrank these."""
+    tags = (fact.get("tags") or "").lower()
+    if "closed" in tags.split(",") or "superseded" in tags.split(","):
+        return True
+    head = (fact.get("content") or "").lstrip().lower()
+    return head.startswith("closed") or head.startswith("superseded") or "superseded by fact" in head[:200]
 _RE_UNSEGMENTED = UNSEGMENTED
 # A letter or digit written against unsegmented script ("用keyring保存"): FTS5 holds the two as one token (_glued).
 # One character of that script, not a run (Codex review on GitHub: UNSEGMENTED's runs made a long run with no letter
@@ -254,6 +265,12 @@ class FactRetriever:
         still the words' (by_meaning offers the rest)."""
         corpus = corpus or self._current
         key = corpus.key
+        # "<domain> hub" is an index request: resolve the domain's hub fact directly instead of ranking
+        # every fact that happens to mention both words (see the hub+path grammar in the fact store).
+        if corpus is self._current and "hub" in {w.strip(_PUNCT).lower() for w in (query or "").split()}:
+            hubs = self._hub_facts(query, category, min_trust, limit)
+            if hubs:
+                return hubs
         terms = query_terms(query or "")
         candidates = {f[key]: f for f in self._fts_candidates(query, category, min_trust, limit * 3, corpus)
                       if self._contains_a_term(terms, f, exact=not roots)}
@@ -552,7 +569,11 @@ class FactRetriever:
             if meaning is not None:  # the words keep (1 - weight) of the say; off, the score is 0.13.0's to the bit
                 cos = meaning.cos(fact["fact_id"]) if meaning.fits(fact["fact_id"], fact["content"]) else meaning.neutral
                 relevance = (1.0 - meaning.weight) * relevance + meaning.weight * cos
-            fact["score"] = relevance * fact["trust_score"]
+            # 0.5 is the default trust: applying it raw halves every result and makes any absolute
+            # floor meaningless. Neutral at 0.5, so trust only matters when someone rates a fact.
+            fact["score"] = relevance * (0.6 + 0.8 * fact["trust_score"])
+            if is_closed(fact):
+                fact["score"] *= _CLOSED_DEMOTION
             if decays is not None:
                 fact["score"] *= decays[i]
         results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
@@ -685,7 +706,19 @@ class FactRetriever:
         ids = self.store.entity_ids(entity)
         if not ids:
             return self.search(entity, category=category, min_trust=min_trust, limit=limit)
-        return self._linked_facts([ids], category, min_trust, limit)
+        # Trust alone cannot order entity-linked facts: a name linked to 30 facts returns them in a
+        # meaningless order. Rank by how much of the fact is ABOUT the name: mention count, density in
+        # a short fact, and whether the name is literally present (not a regex artefact).
+        rows = self._linked_facts([ids], category, min_trust, max(limit * 6, 60))
+        names = [entity.strip().lower()]
+        for f in rows:
+            text = _fact_text(f).lower()
+            hits = sum(text.count(n) for n in names)
+            literal = 1.0 if any(n in text for n in names) else 0.0
+            density = min(1.0, hits / max(2.0, len(text.split()) / 40.0))
+            focus = 1.0 / (1.0 + max(0, len(text) - 800) / 2000.0)
+            f["score"] = round(min(1.0, (0.45 * literal + 0.35 * density + 0.20 * focus) * (0.6 + 0.8 * f["trust_score"])), 4)
+        return sorted(rows, key=lambda x: (x["score"], x.get("updated_at") or ""), reverse=True)[:limit]
 
     def reason(self, entities: list[str], category: str | None = None, limit: int = 10, min_trust: float = 0.3) -> list[dict]:
         """Facts linked to ALL the given entities. When some name is not a known entity, keyword search that still
@@ -723,26 +756,67 @@ class FactRetriever:
         return self._rerank(" ".join(names), lexical, limit)
 
     def related(self, entity: str, category: str | None = None, limit: int = 10, min_trust: float = 0.3) -> list[dict]:
-        """Facts structurally connected to an entity (the entity's atom unbinds to a role), above a noise floor.
-        Keyword search without numpy, vectors, or any fact over the floor."""
-        if not hrr.has_numpy():
+        """Facts connected to an entity through other resolved names it co-occurs with.
+
+        The HRR residual test cannot answer this on real facts: a 1 KB fact bundles far more tokens than
+        the sqrt(dim)=32 capacity, so every vector is noise and the floor rejects everything (or admits
+        everything). Co-occurrence over the entity index, weighted by entity rarity (IDF), is the signal
+        that actually exists: "Relja" links a hundred facts and says nothing, "Tobii" links a handful.
+        """
+        ids = self.store.entity_ids(entity)
+        if not ids:
             return self.search(entity, category=category, min_trust=min_trust, limit=limit)
-        entity_vec = self._atom(entity.strip().lower())  # bare atom, not role-bound: ANY structural match
-        roles = (self._atom(_ROLE_ENTITY), self._atom(_ROLE_CONTENT))  # loop-invariant: encode once
-        floor = _related_floor(self.hrr_dim)
-        scored = []
-        for row in self._vector_rows(category, min_trust):
-            fact = dict(row)
-            fact_vec = self._phases(fact.pop("hrr_vector"))
-            if fact_vec is None:
-                continue
-            sim = max(hrr.similarity(hrr.unbind(fact_vec, entity_vec), role) for role in roles)
-            if sim >= floor:
-                fact["score"] = _shift(sim) * fact["trust_score"]
-                scored.append(fact)
-        if not scored:
+        own = {r["fact_id"] for r in self.store.read(
+            f"SELECT fact_id FROM fact_entities WHERE entity_id IN ({','.join('?' * len(ids))})", ids)}
+        if not own:
             return self.search(entity, category=category, min_trust=min_trust, limit=limit)
-        return sorted(scored, key=lambda x: x["score"], reverse=True)[:limit]
+        marks = ",".join("?" * len(own))
+        # Stay inside the entity's own domain: otherwise a cross-project rare name drags unrelated work in.
+        doms: dict[str, int] = {}
+        for r in self.store.read(f"SELECT tags FROM facts WHERE fact_id IN ({marks})", list(own)):
+            d = (r["tags"] or "").split(",")[0].strip()
+            doms[d] = doms.get(d, 0) + 1
+        domain = max(doms, key=doms.get) if doms else ""
+        links = self.store.read(f"SELECT DISTINCT entity_id FROM fact_entities WHERE fact_id IN ({marks})", list(own))
+        ent_ids = [r["entity_id"] for r in links if r["entity_id"] not in ids]
+        if not ent_ids:
+            return []
+        emarks = ",".join("?" * len(ent_ids))
+        df = {r["entity_id"]: r["c"] for r in self.store.read(
+            f"SELECT entity_id, COUNT(*) c FROM fact_entities WHERE entity_id IN ({emarks}) GROUP BY entity_id", ent_ids)}
+        ent_ids = [e for e in ent_ids if df.get(e, 0) <= 20]
+        if not ent_ids:
+            return []
+        weight = {e: 1.0 / math.log(2 + df[e]) for e in ent_ids}
+        cand = self.store.read(
+            f"SELECT fe.fact_id, fe.entity_id FROM fact_entities fe JOIN facts f ON f.fact_id = fe.fact_id "
+            f"WHERE fe.entity_id IN ({','.join('?' * len(ent_ids))}) AND f.tags LIKE ? AND f.trust_score >= ? "
+            f"AND fe.fact_id NOT IN ({marks})",
+            ent_ids + [f"{domain},%", min_trust] + list(own))
+        scores: dict[int, float] = {}
+        for r in cand:
+            scores[r["fact_id"]] = scores.get(r["fact_id"], 0.0) + weight.get(r["entity_id"], 0.0)
+        if not scores:
+            return self.search(entity, category=category, min_trust=min_trust, limit=limit)
+        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit * 2]
+        rows = self._rows([i for i, _ in top], category, min_trust)
+        best = max(scores.values()) or 1.0
+        for f in rows:
+            f["score"] = round(min(1.0, scores.get(f["fact_id"], 0.0) / best * (0.6 + 0.8 * f["trust_score"])), 4)
+        return sorted(rows, key=lambda x: x["score"], reverse=True)[:limit]
+
+    def _hub_facts(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+        """Facts tagged <domain>.hub where <domain> is a word of the query."""
+        out: list[dict] = []
+        for tok in {w.strip(_PUNCT).lower() for w in (query or "").split()}:
+            sql = (f"SELECT {_FACT_COLUMNS} FROM facts WHERE tags LIKE ? AND tags LIKE '%.hub%' AND trust_score >= ?"
+                   + (" AND category = ? " if category else ""))
+            params = [f"{tok},%", min_trust] + ([category] if category else [])
+            for r in self.store.read(sql, params):
+                f = dict(r)
+                f["score"] = 1.0
+                out.append(f)
+        return out[:limit]
 
     def contradict(self, category: str | None = None, threshold: float = 0.3, limit: int = 10,
                    min_trust: float = 0.0) -> list[dict]:
