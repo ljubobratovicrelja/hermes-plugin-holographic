@@ -148,6 +148,14 @@ FACT_STORE_SCHEMA = {
             "limit": {"type": "integer", "description": "Max results (default: 10, at most 100)."},
         },
         "required": ["action"],
+        # 'required' applies to every action, so the one field an action cannot work without is stated
+        # conditionally. A caller that omits 'content' from add/change/correct then gets a schema-level
+        # error instead of a runtime "missing argument" that invites an identical retry (0.26.7).
+        "allOf": [
+            {"if": {"required": ["action"],
+                    "properties": {"action": {"enum": ["add", "change", "correct"]}}},
+             "then": {"required": ["content"]}},
+        ],
     },
 }
 
@@ -185,6 +193,20 @@ FACT_EXPERIENCE_SCHEMA = {
 # The arguments each tool takes: a KeyError naming one of them is a missing argument, any other a fault (0.17.8)
 _ARGUMENTS = {schema["name"]: frozenset(schema["parameters"]["properties"])
               for schema in (FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA, FACT_EXPERIENCE_SCHEMA)}
+
+
+# Actions that cannot work without 'content'. The schema states this conditionally (see allOf), but a model can
+# still omit it, and the bare "missing argument" reply is the one a looping caller replays unchanged — so the
+# error names the action, the field and the shape it expects (0.26.7).
+def _missing_argument(tool_name: str, args: dict, name: str) -> str:
+    """An error a caller can act on: what was missing, for which action, and what the call should look like."""
+    action = args.get("action")
+    detail = " — the fact text (one standalone sentence)" if name == "content" else ""
+    extra = {"missing": name, "action": action}
+    if name == "content":
+        extra["expected"] = {"action": action or "add", "content": "<one standalone sentence>"}
+    return tool_error(f"{action or tool_name} needs '{name}'{detail}. Nothing was changed.", **extra)
+
 
 # Auto-extraction: (patterns, category) — preferences -> user_pref, decisions -> project. Matched per sentence; the
 # sentence is stored, not the whole message.
@@ -1742,7 +1764,7 @@ class HolographicMemoryProvider(MemoryProvider):
             # fault; a given one too, review of PR #12)
             if exc.args and isinstance(exc.args[0], str) and exc.args[0] in _ARGUMENTS.get(tool_name, ()) \
                     and exc.args[0] not in args:
-                return tool_error(f"Missing required argument: {exc}")
+                return _missing_argument(tool_name, args, exc.args[0])
             return self._failed(tool_name, args, exc)
         except DuplicateContentError as exc:
             return _dumps({"updated": False, "duplicate_of": exc.fact_id,
@@ -2274,7 +2296,7 @@ class HolographicMemoryProvider(MemoryProvider):
     def _change(self, a: dict, missing: str = "") -> str:
         problem = _write_problem(a.get("content") or "", _said(a)) or self._keyword_problem(a)
         if not (a.get("content") or "").strip():
-            return tool_error("change needs the new text in 'content'.")
+            return _missing_argument("fact_store", a, "content")
         if problem:
             return tool_error(f"Not changed: {problem}.")
         # The old text's keywords do not describe the new one: they go unless given again; user tags stay.

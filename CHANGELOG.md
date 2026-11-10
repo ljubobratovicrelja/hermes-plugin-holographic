@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.26.7 — 2026-11-10
+
+### Fixed
+- `fact_store` `add` / `change` / `correct` without `content` no longer returns the bare
+  `Missing required argument: 'content'` that a caller replays unchanged until a loop guard stops the turn. The
+  schema now requires `content` conditionally (`allOf`/`if`/`then`, so `search`, `stats`, `list`, `probe` and the
+  rest stay free of it), and the runtime error names the action, the missing field and the shape it expects
+  (`missing`, `action`, `expected`), so the next call can be built from the reply.
+
 ## 0.26.6 — 2026-11-10
 
 ### Fixed
